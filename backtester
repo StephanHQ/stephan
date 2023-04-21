@@ -1,0 +1,371 @@
+//@version=5
+indicator("Cumulative Backtester",overlay=true, max_labels_count = 500)
+startDateInput = input.time(defval=timestamp("10 Apr 2023"), title="Start Date", group="Backtesting",inline="backtest")
+isTableVisibleInput = input.bool(defval=true, title="Show Table", tooltip="Shows table which contains statistics", group="Backtesting",inline="backtest")
+
+trade_entry_source = input.source(hlc3,"Trade Entry Source", group="Source")
+
+input_starting_money = input.float(10000, "Starting money", group="Traders account")
+input_market_fee = input.float(0.06, "Market fee", group="Traders account")
+input_limit_fee = input.float(0.01, "Limit Fee", group="Traders account")
+input_risk_p_trade = input.float(0.01, "Risk per trade", group="Traders account")
+// Liquidation takes place if trade is under water in the amount of margin
+
+// Trading Fee = Order Value × Trading Fee Rate
+// Order Value = Quantity / Executed Price (in terms of Bitcoin contract pricing, not necessary when using Dollar contract pricing)
+
+tp_option = input.string("Laddered_TP", "Select TP type", ["Laddered_TP", "Set_TP"], inline = "ladderred_tp", group="laddered_tp")
+tp_laddered_steps = input.float(0.2, "Ladderd steps", inline = "ladderred_tp", group="laddered_tp")
+tp_laddered_amount = input.float(0.1, "Ladderd TP Amount", inline = "ladderred_tp", group="laddered_tp")
+
+tp_1 = input.float(0.07,"TP1 in %", inline="tp", group="set TP") / 100
+tp_2 = input.float(0.2,"TP2 in %", inline="tp", group="set TP") / 100
+tp_3 = input.float(0.8,"TP3 in %", inline="tp", group="set TP") / 100
+tp_4 = input.float(1.88,"TP4 in %", inline="tp", group="set TP") / 100
+tp_amount = input.float(0.1,"TP amount", inline="tp", group="set TP")
+
+// line to change startDateInput
+if barstate.islastconfirmedhistory
+    verticalstartDateInputLine = line.new(x1=startDateInput, y1=high, x2=startDateInput, y2=low, extend=extend.both, color=color.orange, width=2, xloc=xloc.bar_time)
+
+type trading_account
+    float original_money
+    float market_fee
+    float limit_fee
+    float risk_per_trade
+    float money
+var broker = trading_account.new(input_starting_money, input_market_fee, input_limit_fee, input_risk_p_trade, input_starting_money)
+
+type trade_placed
+    float entry_price
+    float pos_size
+
+type trade
+    string trade_type //"long" or "short"
+    bool trade_open = na// is trade still open? then true
+    float last_entry_price = na
+    float next_tp_price = na
+    float which_cur_tp_step = 1 
+    array<trade_placed> arr_placed_trades
+    float stop_loss = na
+    float stop_loss_in_perc = na
+    int how_often_trade_placed = 0
+    int how_often_tp_hit = 0
+    int how_often_liqu = 0
+    float cur_position_size = 0 // per trade adds specific amount
+    float yield = 0 // in percent, overall percentage gain of trade
+    int profited_amount = 0
+    int liquidated_amount = 0
+    float realized_profit = 0
+    float unrealized_profit = 0
+    float fees_paid = 0
+
+var cum_long_trades = trade.new("long")
+var cum_short_trades = trade.new("short")
+
+type trade_statistics
+    int elapsed_days
+    int total_trades_placed
+    int closed_trades
+    float long_ratio
+    float short_ratio
+    float unrealized_profit
+    float profited_amount
+    float liquidated_times
+    float liquidated_amount
+    float win_rate_long
+    float win_rate_short
+    float all_fees
+
+    float avg_yield
+    float yield_30d
+    float yield_60d
+    float yield_90d
+    float yield_120d
+    float yield_150d
+    float yield_180d
+    float yield_210d
+var stats = trade_statistics.new()
+
+calcNet(avg_yield, fee, total_trades, period_trading, elaps_days_)=>
+    math.round(math.pow(1 + avg_yield - fee, total_trades * (period_trading / elaps_days_)),2)
+
+fill_stats()=>
+    stats.elapsed_days := math.round((time - startDateInput) / 86400000)
+    stats.total_trades_placed := cum_long_trades.how_often_trade_placed + cum_short_trades.how_often_trade_placed
+    stats.long_ratio := math.round(cum_long_trades.how_often_trade_placed / stats.total_trades_placed,2)
+    stats.short_ratio := math.round(cum_short_trades.how_often_trade_placed / stats.total_trades_placed,2)
+
+    stats.win_rate_long := math.round((cum_long_trades.how_often_trade_placed-cum_long_trades.how_often_liqu)/cum_long_trades.how_often_trade_placed,2)
+    stats.win_rate_short := math.round((cum_short_trades.how_often_trade_placed-cum_short_trades.how_often_liqu)/cum_short_trades.how_often_trade_placed,2)
+    stats.liquidated_times := cum_long_trades.how_often_liqu + cum_short_trades.how_often_liqu
+    stats.liquidated_amount := cum_long_trades.liquidated_amount + cum_short_trades.liquidated_amount
+
+    stats.avg_yield := math.round((broker.money / broker.original_money) / stats.total_trades_placed,2)
+    stats.all_fees := cum_long_trades.fees_paid + cum_short_trades.fees_paid
+
+    // including fees and exponential formula, displaying theoretical AVERAGE 
+    x_fees = stats.all_fees / stats.total_trades_placed
+    stats.yield_30d := calcNet(stats.avg_yield, x_fees, stats.total_trades_placed, 30, stats.elapsed_days)
+    stats.yield_60d := calcNet(stats.avg_yield, x_fees, stats.total_trades_placed, 60, stats.elapsed_days)
+    stats.yield_90d := calcNet(stats.avg_yield, x_fees, stats.total_trades_placed, 90, stats.elapsed_days)
+    stats.yield_120d := calcNet(stats.avg_yield, x_fees, stats.total_trades_placed, 120, stats.elapsed_days)
+    stats.yield_150d := calcNet(stats.avg_yield, x_fees, stats.total_trades_placed, 150, stats.elapsed_days)
+    stats.yield_180d := calcNet(stats.avg_yield, x_fees, stats.total_trades_placed, 180, stats.elapsed_days)
+    stats.yield_210d := calcNet(stats.avg_yield, x_fees, stats.total_trades_placed, 210, stats.elapsed_days)
+
+
+get_entry_and_sl_for_trade(string type_of_trade) =>
+    float entry_price = na
+    float stop_loss = na
+    // if green candle
+    if close > open
+        // check for upper wick -> SHORT
+        if type_of_trade == "short"
+            // take close as entry and high as stop loss
+            entry_price := close
+            stop_loss := high
+            broker.money
+        // check for lower wick -> LONG
+        else if type_of_trade == "long"
+            // take open as entry and low as stop loss (entry on reverse)
+            entry_price := open
+            stop_loss := low
+
+    // red candle
+    else
+        //check for upper wick -> SHORT
+        if type_of_trade == "short"
+            // take close as entry and high as stop loss (entry on reverse)
+            entry_price := open
+            stop_loss := high
+        // check for lower wick -> LONG
+        else if type_of_trade == "long"    
+            // take open as entry and low as stop loss 
+            entry_price := close
+            stop_loss := low
+    [entry_price,stop_loss]
+
+get_fee_amount(string entry_type)=>
+    fee_amount = switch entry_type
+        "market" => broker.market_fee
+        "limit" => broker.limit_fee
+    fee_amount
+
+set_next_tp(trade i)=>
+    if tp_option == "Laddered_TP"
+        i.next_tp_price := i.last_entry_price * (1 + tp_laddered_steps * i.which_cur_tp_step)
+
+    else if tp_option == "Set_TP" // use set tp
+        i.next_tp_price := switch i.which_cur_tp_step
+            1 => i.last_entry_price * (1 + tp_1)
+            2 => i.last_entry_price * (1 + tp_2)
+            3 => i.last_entry_price * (1 + tp_3)
+            4 => i.last_entry_price * (1 + tp_4)
+    else
+        label.new(bar_index, high, "Error setting TP")
+
+    i.which_cur_tp_step +=1
+
+tp_hit(trade i)=>
+    // if laddered option is used
+    // declaration of all variables
+    float overall_position_size = 0
+
+    float fees = 0
+    float real_profit = 0
+    float real_loss = 0 
+
+    float unreal_profit = 0
+    float unreal_loss = 0 
+
+    fee_rate = broker.limit_fee
+
+    // check all trade entries with position their size
+    arr_size = i.arr_placed_trades.size()
+    for j=0 to arr_size-1 by 1
+        if j <= i.arr_placed_trades.size() - 1
+            y = i.arr_placed_trades.get(j)
+
+            // check if trade has position size left otherwise remove
+            if y.pos_size <= 0
+                array.remove(i.arr_placed_trades,j)
+            // if it does, calc TP
+            else
+                val = y.pos_size * (close / y.entry_price)
+                float val_tp = na
+
+                if tp_option == "Laddered_TP"
+                    val_tp := val * tp_laddered_amount * (1 - fee_rate)
+                    fees += val * tp_laddered_amount * fee_rate
+                    unreal_profit += val * (1 - tp_laddered_amount)
+                else if tp_option == "Set_TP"
+                    val_tp := val * tp_amount * (1 - fee_rate) 
+                    fees += val * tp_amount * fee_rate
+                    unreal_profit += val * (1 - tp_amount)
+
+                y.pos_size -= val_tp
+                overall_position_size += y.pos_size
+
+                if val_tp > 0
+                    real_profit += val_tp
+                else 
+                    real_loss += val_tp
+
+    // properties filled with variables
+    broker.money += real_profit - real_loss
+    i.fees_paid += fees
+    i.cur_position_size := overall_position_size
+    i.unrealized_profit := unreal_profit - unreal_loss
+    set_next_tp(i)
+
+sl_hit(trade i)=>
+    i.trade_open := false
+    i.how_often_liqu += 1
+
+    fee_rate = broker.market_fee
+
+    float fees = 0
+    float profit = 0
+    float loss = 0 
+
+    // calc each trades value with each trades' entry price and position size value at close
+    for y in i.arr_placed_trades
+        val = i.trade_type == "long" ? y.pos_size * (close / y.entry_price) * (1 - fee_rate) : y.pos_size * (y.entry_price/close) * (1 - fee_rate)
+
+        if val > 0
+            profit += val
+        else 
+            loss += val
+
+    broker.money += profit - loss
+
+    i.fees_paid += fees
+    i.cur_position_size := 0
+    i.unrealized_profit := 0
+    i.last_entry_price := na
+    i.stop_loss := na
+    i.stop_loss_in_perc := na
+    array.clear(i.arr_placed_trades)
+    i.next_tp_price := na
+    i.which_cur_tp_step := 1
+    1
+
+
+create_trade(trade i, string entry_type, int position_size)=>
+    
+    [entry_price,stop_loss] = get_entry_and_sl_for_trade(i.trade_type)
+    stop_loss_in_perc = math.abs(1-stop_loss/entry_price)
+
+    i.trade_open := true
+    i.last_entry_price := entry_price
+    i.stop_loss := stop_loss
+    i.stop_loss_in_perc := stop_loss_in_perc
+    i.which_cur_tp_step := 1
+    set_next_tp(i)
+
+    i.how_often_trade_placed += 1
+    
+    x_fees = get_fee_amount(entry_type)
+    i.cur_position_size += position_size - x_fees
+    i.fees_paid += x_fees
+
+    x = trade_placed.new(entry_price, position_size)
+    i.arr_placed_trades.push(x)
+    label.new(bar_index,high,"trade")
+
+update_current_trades(trade i) =>
+    // only Longs now
+    if i.trade_open and i.arr_placed_trades.size() > 0
+        
+        // if stop loss hit
+        if i.trade_type =="long" and low < i.stop_loss or i.trade_type == "short" and high > i.stop_loss
+            sl_hit(i)
+
+        // if TP hit
+        else if i.trade_type =="long" and close > i.next_tp_price or i.trade_type == "short" and close < i.next_tp_price
+            tp_hit(i)
+            
+// TABLE
+if isTableVisibleInput == true and time > startDateInput
+    var statisticsTable = table.new(position.top_right, 2, 30, bgcolor=color.new(color.white, 10), frame_width=2, frame_color=color.new(color.lime, 10), border_color=color.new(color.lime, 10), border_width=2)
+    if barstate.islast
+        fill_stats()
+        
+
+        table.cell(statisticsTable, 0, 0, text="Backtesting", text_color=color.teal)
+        table.cell(statisticsTable, 1, 0, text=str.tostring(syminfo.ticker), text_color=color.teal)
+        table.cell(statisticsTable, 0, 1, text="Starting Money", text_color=color.black)
+        table.cell(statisticsTable, 1, 1, text=str.tostring(broker.original_money) + " $", text_color=color.blue)
+        table.cell(statisticsTable, 0, 2, text="Net broker money:", text_color=color.black)
+        table.cell(statisticsTable, 1, 2, text=str.tostring(broker.money) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, 3, text="Unrealized Profit", text_color=color.black)
+        table.cell(statisticsTable, 1, 3, text=str.tostring(stats.unrealized_profit) + " %", text_color=color.blue)
+    
+        table.cell(statisticsTable, 0, 4, text="30 Days Net", text_color=color.black)
+        table.cell(statisticsTable, 1, 4, text=str.tostring(stats.yield_30d) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, 5, text="60 Days Net", text_color=color.black)
+        table.cell(statisticsTable, 1, 5, text=str.tostring(stats.yield_60d) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, 6, text="90 Days Net", text_color=color.black)
+        table.cell(statisticsTable, 1, 6, text=str.tostring(stats.yield_90d) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, 7, text="120 Days Net", text_color=color.black)
+        table.cell(statisticsTable, 1, 7, text=str.tostring(stats.yield_120d) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, 8, text="150 Days Net", text_color=color.black)
+        table.cell(statisticsTable, 1, 8, text=str.tostring(stats.yield_150d) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, 9, text="180 Days Net", text_color=color.black)
+        table.cell(statisticsTable, 1, 9, text=str.tostring(stats.yield_180d) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, 10, text="210 Days Net", text_color=color.black)
+        table.cell(statisticsTable, 1, 10, text=str.tostring(stats.yield_210d) + " %", text_color=color.blue)
+        
+        table.cell(statisticsTable, 0, 11, text="Days Elapsed:", text_color=color.black)
+        table.cell(statisticsTable, 1, 11, text=str.tostring(stats.elapsed_days), text_color=color.black)
+
+        c = 12
+        table.cell(statisticsTable, 0, c, text=" ", text_color=color.black)
+        table.cell(statisticsTable, 0, c+1, text="Trades Placed", text_color=color.black)
+        table.cell(statisticsTable, 1, c+1, text=str.tostring(stats.total_trades_placed), text_color=color.blue)
+        table.cell(statisticsTable, 0, c+2, text="Trades Closed", text_color=color.black)
+        table.cell(statisticsTable, 1, c+2, text=str.tostring(stats.closed_trades), text_color=color.blue)
+        table.cell(statisticsTable, 0, c+3, text="Trades per Day", text_color=color.black)
+        table.cell(statisticsTable, 1, c+3, text=str.tostring(math.round(stats.total_trades_placed/stats.elapsed_days)), text_color=color.blue)
+        table.cell(statisticsTable, 0, c+4, text="Avg. Trade yield", text_color=color.black)
+        table.cell(statisticsTable, 1, c+4, text=str.tostring(stats.avg_yield) + " %", text_color=color.blue)
+        table.cell(statisticsTable, 0, c+5, text="Long/Short Ratio", text_color=color.black)
+        table.cell(statisticsTable, 1, c+5, text=str.tostring(stats.long_ratio) + " to " + str.tostring(stats.short_ratio), text_color=color.blue)
+        table.cell(statisticsTable, 0, c+6, text="Win rate Longs", text_color=color.black)
+        table.cell(statisticsTable, 1, c+6, text=str.tostring(stats.win_rate_long*10) + " out of 10", text_color=color.blue)
+        table.cell(statisticsTable, 0, c+7, text="Win rate Shorts", text_color=color.black)
+        table.cell(statisticsTable, 1, c+7, text=str.tostring(stats.win_rate_short*10) + " out of 10", text_color=color.blue)
+        table.cell(statisticsTable, 0, c+8, text="Profited Amoount", text_color=color.black)
+        table.cell(statisticsTable, 1, c+8, text=str.tostring(stats.profited_amount), text_color=color.blue)
+        table.cell(statisticsTable, 0, c+9, text="Liquidated times", text_color=color.black)
+        table.cell(statisticsTable, 1, c+9, text=str.tostring(stats.liquidated_times), text_color=color.blue)
+        table.cell(statisticsTable, 0, c+10, text="Liquidated amount", text_color=color.black)
+        table.cell(statisticsTable, 1, c+10, text=str.tostring(stats.liquidated_amount), text_color=color.blue)
+        table.cell(statisticsTable, 0, c+11, text="Sum of fees", text_color=color.black)
+        table.cell(statisticsTable, 1, c+11, text=str.tostring(stats.all_fees) + " %", text_color=color.blue)
+
+if time > startDateInput
+
+    if na(cum_long_trades.arr_placed_trades)
+        cum_long_trades.arr_placed_trades := array.new<trade_placed>()
+
+    if trade_entry_source == 1 or trade_entry_source == 3
+        create_trade(cum_long_trades,"limit",100)
+    // if trade_entry_source == 2 or trade_entry_source == 3
+    //     create_trade("short","limit",100)
+    
+    if cum_long_trades.arr_placed_trades.size() > 0
+        update_current_trades(cum_long_trades)
+    // update_current_trades(cum_short_trades)
+
+
+//plot TP ENTRY SL of LONGS
+plot(cum_long_trades.next_tp_price, "Long Next TP", color.green)
+plot(cum_long_trades.last_entry_price, "Long Last Entry Price", color.yellow)
+plot(cum_long_trades.stop_loss, "Long SL", color.red)
+
+//plot TP ENTRY SL of SHORTS
+plot(cum_long_trades.next_tp_price, "Long Next TP", color.blue)
+plot(cum_long_trades.last_entry_price, "Long Last Entry Price", color.orange)
+plot(cum_long_trades.stop_loss, "Long SL", color.maroon)
